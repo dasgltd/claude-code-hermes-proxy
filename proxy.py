@@ -114,6 +114,7 @@ def build_cmd(
         "--output-format", "stream-json" if stream else "json",
         "--max-turns", "1",
         "--no-session-persistence",
+        "--dangerously-skip-permissions",
     ]
     if stream:
         cmd.extend(["--verbose", "--include-partial-messages"])
