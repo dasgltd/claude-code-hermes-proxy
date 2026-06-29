@@ -112,7 +112,7 @@ def build_cmd(
         CLAUDE_BIN,
         "-p", prompt,
         "--output-format", "stream-json" if stream else "json",
-        "--max-turns", "1",
+        "--max-turns", "10",
         "--no-session-persistence",
         "--dangerously-skip-permissions",
     ]
