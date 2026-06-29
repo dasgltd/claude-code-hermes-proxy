@@ -33,7 +33,7 @@ Your plan limits apply, exactly as when you use Claude Code directly.
 ## Install
 
 ```bash
-git clone https://github.com/your-username/claude-proxy
+git clone https://github.com/dasgltd/claude-code-hermes-proxy
 cd claude-proxy
 bash install.sh
 ```
