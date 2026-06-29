@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Proxy - Anthropic API → claude CLI bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/claude-proxy/venv/bin/python %h/.local/lib/claude-proxy/proxy.py
+WorkingDirectory=%h/.local/lib/claude-proxy
+Restart=always
+RestartSec=3
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
