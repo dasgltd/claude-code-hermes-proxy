@@ -244,8 +244,20 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
 
         last_text = ""
         output_tokens = 0
+        PING_INTERVAL = 5  # seconds — keeps SSE alive during long tool-use chains
 
-        async for raw in proc.stdout:
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=PING_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+                continue
+
+            if not raw:
+                break
+
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
