@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # @file proxy.py
-# @version 1.0.0
-# 
+# @version 1.1.0
+#
 # PROPRIEDADE INTELECTUAL DA DASG CONSULTING LTDA.
 # CNPJ 61.628.969/0001-04
 # Autor: Daniel A. Silva de la Garza
-# 
+#
 # @description
 # claude-proxy: Translates Anthropic Messages API calls to `claude` CLI subprocess calls.
 # ==============================================================================
 """
-claude-proxy: Translates Anthropic Messages API calls to `claude` CLI subprocess calls.Third-party apps using a Claude Code OAuth token get HTTP 400
+claude-proxy: Translates Anthropic Messages API calls to `claude` CLI subprocess calls.
+
+Third-party apps using a Claude Code OAuth token get HTTP 400
 "Third-party apps draw from extra usage" when calling api.anthropic.com directly.
 This proxy routes those calls through the official `claude` CLI, which is a
 first-party Anthropic app and consumes from the Claude plan limits instead.
@@ -28,10 +30,20 @@ Usage:
 Then point any Anthropic client at the proxy:
   ANTHROPIC_BASE_URL=http://127.0.0.1:11435
   ANTHROPIC_API_KEY=placeholder           # any non-empty value; ignored by proxy
+
+Design notes:
+  - The `tools` array from inbound requests is intentionally dropped. Claude Code
+    drives its own toolset (file, terminal, etc.); we cannot inject caller-supplied
+    tool schemas into a CLI subprocess. Callers that depend on server-side tool_use
+    blocks will not get them from this proxy by design.
+  - The user prompt is always fed via STDIN (never as an argv positional) so a large
+    prompt can never trigger "Argument list too long". The system prompt is written
+    to a temp file once it exceeds a safe inline size for the same reason.
 """
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -44,6 +56,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "11435"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
+MAX_TURNS = os.environ.get("PROXY_MAX_TURNS", "30")
+# argv stays well under the system limit; anything bigger goes to a temp file.
+INLINE_SYSTEM_LIMIT = 4096
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [claude-proxy] %(levelname)s: %(message)s"
+)
+log = logging.getLogger("claude-proxy")
 
 app = FastAPI(title="claude-proxy")
 
@@ -54,15 +74,14 @@ app = FastAPI(title="claude-proxy")
 def extract_text(content) -> str:
     """
     Flatten a content value (string or list of Anthropic content blocks) to plain text.
-    
-    BUSINESS RULE: Anthropic API allows `content` to be either a flat string or a complex
-    array of objects (text blocks, tool results). We must normalize this into a single 
-    string so we can pass it as a CLI argument to the `claude` binary without breaking
-    the shell execution.
-    
+
+    Anthropic API allows `content` to be either a flat string or a complex array of
+    objects (text blocks, tool results). We normalize this into a single string so
+    we can hand it to the `claude` binary.
+
     Args:
         content (str | list): The content payload from an Anthropic message block.
-        
+
     Returns:
         str: A single flattened string containing all text and tool results.
     """
@@ -87,20 +106,18 @@ def build_prompt_and_system(
 ) -> tuple[str, str | None]:
     """
     Convert the Anthropic messages array into a single prompt and system prompt.
-    
-    BUSINESS RULE: The `claude` CLI does not natively accept a JSON array of prior 
-    messages in stateless mode (`-p`). To simulate memory, we must intercept all 
-    historical messages, format them into a custom XML-like `<conversation_history>` 
-    block, and prepend them to the system prompt. The very last user message is 
-    then extracted to serve as the actual CLI prompt.
-    
+
+    The `claude` CLI does not natively accept a JSON array of prior messages in
+    stateless mode (`-p`). To simulate memory, we format all historical messages
+    into a `<conversation_history>` block and prepend it to the system prompt. The
+    last user message becomes the actual CLI prompt (fed via stdin).
+
     Args:
         messages (list): Array of message objects containing 'role' and 'content'.
         system (str | None): The original system prompt, if any.
-        
+
     Returns:
-        tuple[str, str | None]: A tuple containing the extracted prompt (str) and 
-        the enriched system prompt (str or None).
+        tuple[str, str | None]: (extracted prompt, enriched system prompt).
     """
     if not messages:
         raise HTTPException(status_code=400, detail="messages array is empty")
@@ -133,7 +150,6 @@ def build_prompt_and_system(
 
 
 def build_cmd(
-    prompt: str,
     system: str | None,
     model: str | None,
     system_file: str | None = None,
@@ -141,27 +157,26 @@ def build_cmd(
 ) -> list[str]:
     """
     Constructs the CLI command list to execute the claude binary.
-    
-    BUSINESS RULE: We pass `--dangerously-skip-permissions` to ensure the CLI
-    does not hang waiting for human approval when executing. We also use 
-    `--no-session-persistence` to prevent polluting the local Claude Code history
-    with API requests.
-    
+
+    The user prompt is NOT included here — it is always piped via stdin so that an
+    arbitrarily large prompt cannot overflow the argv limit. We pass
+    `--dangerously-skip-permissions` so the CLI never blocks on human approval, and
+    `--no-session-persistence` so API traffic does not pollute local session history.
+
     Args:
-        prompt (str): The final user message to be evaluated.
-        system (str | None): The system prompt (inline). Used if system_file is None.
+        system (str | None): The system prompt (inline). Used only if system_file is None.
         model (str | None): The Claude model to use.
-        system_file (str | None): Path to a temp file containing the system prompt if too large.
+        system_file (str | None): Path to a temp file holding the system prompt if large.
         stream (bool): Whether to request SSE streaming output from the CLI.
-        
+
     Returns:
-        list[str]: The command array ready for subprocess execution.
+        list[str]: The command array ready for subprocess execution (prompt via stdin).
     """
     cmd = [
         CLAUDE_BIN,
-        "-p", prompt,
+        "-p",
         "--output-format", "stream-json" if stream else "json",
-        "--max-turns", "10",
+        "--max-turns", MAX_TURNS,
         "--no-session-persistence",
         "--dangerously-skip-permissions",
     ]
@@ -179,44 +194,88 @@ def build_cmd(
 def _maybe_write_tempfile(text: str | None) -> tuple[str | None, str | None]:
     """
     Write text to a temporary file if it exceeds typical shell argument limits.
-    
-    BUSINESS RULE: Shell commands can crash with `Argument list too long` if the 
-    system prompt (enriched with massive conversation history) is passed inline. 
-    If the text exceeds 4096 characters, we dump it to a temporary file and tell 
-    the CLI to read from it.
-    
+
+    The system prompt (enriched with conversation history) can be huge. If it exceeds
+    INLINE_SYSTEM_LIMIT characters we dump it to a temp file and tell the CLI to read
+    it via --system-prompt-file, keeping argv small.
+
     Args:
         text (str | None): The text to potentially write.
-        
+
     Returns:
-        tuple[str | None, str | None]: A tuple containing (inline_text, tempfile_path).
+        tuple[str | None, str | None]: (inline_text, tempfile_path).
         If written to file, inline_text will be None.
     """
-    if not text or len(text) <= 4096:
+    if not text or len(text) <= INLINE_SYSTEM_LIMIT:
         return text, None
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
     tmp.write(text)
     tmp.close()
     return None, tmp.name
 
 
+def _normalize_usage(raw: dict | None) -> dict:
+    """
+    Map the claude CLI usage object to the Anthropic Messages API usage shape.
+
+    The CLI reports input_tokens, output_tokens, cache_creation_input_tokens and
+    cache_read_input_tokens. We surface all of them so the caller (Hermes) can
+    budget context accurately instead of seeing zeros.
+
+    Args:
+        raw (dict | None): The `usage` object from the CLI result JSON.
+
+    Returns:
+        dict: Anthropic-style usage object.
+    """
+    raw = raw or {}
+    return {
+        "input_tokens": raw.get("input_tokens", 0) or 0,
+        "output_tokens": raw.get("output_tokens", 0) or 0,
+        "cache_creation_input_tokens": raw.get("cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": raw.get("cache_read_input_tokens", 0) or 0,
+    }
+
+
+def _estimate_tokens(text: str) -> int:
+    """
+    Rough token estimate used only by the count_tokens endpoint.
+
+    We have no local tokenizer, so we approximate at ~4 characters per token, which
+    is close enough for context-budgeting purposes and far better than a 404.
+
+    Args:
+        text (str): Text to estimate.
+
+    Returns:
+        int: Estimated token count.
+    """
+    return max(1, len(text) // 4) if text else 0
+
+
 # ── Streaming response ────────────────────────────────────────────────────────
+
+
+async def _drain(stream) -> bytes:
+    """Read a subprocess pipe to EOF, returning all bytes (prevents pipe-fill deadlock)."""
+    if stream is None:
+        return b""
+    return await stream.read()
 
 
 async def _stream_sse(prompt: str, system: str | None, model: str | None):
     """
     Run claude CLI asynchronously and yield Anthropic-compatible SSE events.
-    
-    BUSINESS RULE: Third-party apps like Open WebUI expect the standard Anthropic 
-    Server-Sent Events (SSE) stream format (`event: message_start`, `content_block_delta`, etc).
-    We must spawn the CLI in `stream-json` format, parse each JSON line yielded by 
-    Claude Code, and repackage it dynamically into the official SSE API schema.
-    
+
+    Captures stderr and the process exit code. If the CLI fails (rate limit, auth
+    expiry, bad flag) the error text is surfaced INTO the stream instead of silently
+    ending with an empty message, so the caller sees the real reason.
+
     Args:
-        prompt (str): The user prompt.
+        prompt (str): The user prompt (sent via stdin).
         system (str | None): The system prompt and history.
         model (str | None): The requested model name.
-        
+
     Yields:
         str: Formatted SSE payload strings.
     """
@@ -224,13 +283,21 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
     actual_model = model or "claude-sonnet-4-6"
 
     inline_system, system_file = _maybe_write_tempfile(system)
+    stderr_task = None
     try:
-        cmd = build_cmd(prompt, inline_system, model, system_file=system_file, stream=True)
+        cmd = build_cmd(inline_system, model, system_file=system_file, stream=True)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
+        # Feed the prompt via stdin, then close it so the CLI can proceed.
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+        # Drain stderr concurrently so a full pipe never deadlocks the process.
+        stderr_task = asyncio.create_task(_drain(proc.stderr))
 
         yield (
             f"event: message_start\n"
@@ -243,7 +310,8 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
         yield f"event: ping\ndata: {json.dumps({'type':'ping'})}\n\n"
 
         last_text = ""
-        output_tokens = 0
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        saw_error = False
         PING_INTERVAL = 5  # seconds — keeps SSE alive during long tool-use chains
 
         while True:
@@ -282,21 +350,48 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
                         f"event: content_block_delta\n"
                         f"data: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':delta}})}\n\n"
                     )
-                output_tokens = msg.get("usage", {}).get("output_tokens", output_tokens)
+                if msg.get("usage"):
+                    usage = _normalize_usage(msg.get("usage"))
 
             elif etype == "result":
-                output_tokens = event.get("usage", {}).get("output_tokens", output_tokens)
+                if event.get("usage"):
+                    usage = _normalize_usage(event.get("usage"))
+                if event.get("is_error") or event.get("subtype") not in (None, "success"):
+                    saw_error = True
+                    err = event.get("result") or event.get("error") or "claude CLI reported an error"
+                    if not last_text:
+                        yield (
+                            f"event: content_block_delta\n"
+                            f"data: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':f'[claude-proxy error] {err}'}})}\n\n"
+                        )
 
         await proc.wait()
+        stderr_bytes = await stderr_task if stderr_task else b""
+        stderr_text = stderr_bytes.decode(errors="replace").strip()
+
+        # Process failed and produced nothing useful — surface the real reason.
+        if proc.returncode != 0 and not last_text and not saw_error:
+            detail = stderr_text or f"claude CLI exited with code {proc.returncode}"
+            log.error("streaming subprocess failed: %s", detail)
+            yield (
+                f"event: content_block_delta\n"
+                f"data: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':f'[claude-proxy error] {detail}'}})}\n\n"
+            )
+        elif proc.returncode != 0 and stderr_text:
+            log.warning("streaming subprocess exit %s with stderr: %s", proc.returncode, stderr_text[:500])
+
+        stop_reason = "end_turn" if (proc.returncode == 0 and not saw_error) else "error"
 
         yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
         yield (
             f"event: message_delta\n"
-            f"data: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':output_tokens}})}\n\n"
+            f"data: {json.dumps({'type':'message_delta','delta':{'stop_reason':stop_reason,'stop_sequence':None},'usage':{'output_tokens':usage.get('output_tokens', 0)}})}\n\n"
         )
         yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
 
     finally:
+        if stderr_task and not stderr_task.done():
+            stderr_task.cancel()
         if system_file:
             try:
                 os.unlink(system_file)
@@ -311,15 +406,14 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
 async def messages_endpoint(request: Request):
     """
     FastAPI endpoint intercepting standard Anthropic API calls.
-    
-    BUSINESS RULE: This is the main entrypoint that tricks third-party apps into 
-    thinking they are talking directly to Anthropic. We parse the standard JSON 
-    body, extract parameters, and decide whether to route to the SSE generator 
-    or wait synchronously for the full response.
-    
+
+    Parses the standard JSON body and either streams (SSE) or returns a synchronous
+    JSON response. On CLI failure in the non-streaming path it returns a real 502 so
+    the caller never sees a silent empty 200.
+
     Args:
         request (Request): The incoming FastAPI HTTP request.
-        
+
     Returns:
         StreamingResponse | JSONResponse: The proxied response in Anthropic format.
     """
@@ -348,13 +442,14 @@ async def messages_endpoint(request: Request):
     # Non-streaming
     inline_system, system_file = _maybe_write_tempfile(combined_system)
     try:
-        cmd = build_cmd(prompt, inline_system, model, system_file=system_file, stream=False)
+        cmd = build_cmd(inline_system, model, system_file=system_file, stream=False)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate(input=prompt.encode("utf-8"))
     finally:
         if system_file:
             try:
@@ -362,12 +457,37 @@ async def messages_endpoint(request: Request):
             except OSError:
                 pass
 
+    stderr_text = (stderr or b"").decode(errors="replace").strip()
+
+    # Hard failure: non-zero exit with no parseable output → real error, not empty 200.
+    if proc.returncode != 0:
+        detail = stderr_text or f"claude CLI exited with code {proc.returncode}"
+        log.error("non-streaming subprocess failed (%s): %s", proc.returncode, detail)
+        return JSONResponse(
+            status_code=502,
+            content={"type": "error", "error": {"type": "api_error", "message": detail}},
+        )
+
+    raw_out = stdout.decode(errors="replace")
     text = ""
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    is_error = False
     try:
-        data = json.loads(stdout.decode(errors="replace"))
+        data = json.loads(raw_out)
         text = data.get("result", "")
+        usage = _normalize_usage(data.get("usage"))
+        is_error = bool(data.get("is_error")) or data.get("subtype") not in (None, "success")
     except (json.JSONDecodeError, AttributeError):
-        text = stdout.decode(errors="replace").strip()
+        text = raw_out.strip()
+
+    # CLI ran but reported a logical error, or produced nothing — surface it.
+    if is_error or (not text and stderr_text):
+        detail = text or stderr_text or "claude CLI reported an error"
+        log.error("non-streaming logical error: %s", detail)
+        return JSONResponse(
+            status_code=502,
+            content={"type": "error", "error": {"type": "api_error", "message": detail}},
+        )
 
     return JSONResponse({
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -377,19 +497,50 @@ async def messages_endpoint(request: Request):
         "model": model or "claude-sonnet-4-6",
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "usage": usage,
     })
+
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens_endpoint(request: Request):
+    """
+    Approximate the Anthropic token-counting endpoint.
+
+    Returns an estimated input_tokens count (~4 chars/token) over the system prompt
+    plus all message content. This is an estimate — we have no local tokenizer — but
+    it lets the caller budget context instead of hitting a 404 and falling back blind.
+
+    Args:
+        request (Request): The incoming FastAPI HTTP request.
+
+    Returns:
+        JSONResponse: {"input_tokens": <estimate>}.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    system = body.get("system")
+    if isinstance(system, list):
+        system = extract_text(system)
+
+    total = _estimate_tokens(system or "")
+    for msg in body.get("messages", []):
+        total += _estimate_tokens(extract_text(msg.get("content", "")))
+
+    return JSONResponse({"input_tokens": total})
 
 
 @app.get("/health")
 async def health():
     """
     Health check endpoint to verify service uptime and CLI detection.
-    
+
     Returns:
         dict: Status message and the resolved path to the claude binary.
     """
-    return {"status": "ok", "claude_bin": CLAUDE_BIN}
+    return {"status": "ok", "claude_bin": CLAUDE_BIN, "max_turns": MAX_TURNS}
 
 
 if __name__ == "__main__":
