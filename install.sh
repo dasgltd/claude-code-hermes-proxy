@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# install.sh — Install claude-proxy as a systemd user service
+# ==============================================================================
+# @file install.sh
+# @version 1.0.0
+# 
+# PROPRIEDADE INTELECTUAL DA DASG CONSULTING LTDA.
+# CNPJ 61.628.969/0001-04
+# Autor: Daniel A. Silva de la Garza
+# 
+# @description
+# Install claude-proxy as a systemd user service.
+# ==============================================================================
 #
 # Usage:
 #   bash install.sh            # install on port 11435 (default)

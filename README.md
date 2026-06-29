@@ -59,6 +59,12 @@ export ANTHROPIC_API_KEY=placeholder   # any non-empty string; ignored by proxy
 
 The `ANTHROPIC_API_KEY` is required by most SDKs for format validation but is never sent anywhere — the proxy ignores it and the `claude` CLI handles auth from `~/.claude/.credentials.json`.
 
+## Security Notes
+> [!WARNING]
+> This proxy completely ignores the `ANTHROPIC_API_KEY` provided in the client headers. It relies entirely on the local OAuth credentials established by running `claude` on the host machine. 
+> 
+> No hardcoded secrets, tokens, or API keys are stored in this codebase. Do not expose port 11435 to the public internet without adding an authentication layer to the FastAPI router, otherwise anyone could consume your Claude Code credits.
+
 ## Hermes integration
 
 In `~/.hermes/config.yaml`:
@@ -180,3 +186,10 @@ rm -rf ~/.local/lib/claude-proxy
 rm ~/.config/systemd/user/claude-proxy.service
 systemctl --user daemon-reload
 ```
+
+## Contributing
+Internal contributors should ensure that any modifications to `proxy.py` maintain strict compatibility with the official Anthropic Messages API schema. When adding new features, update the docstrings following PEP 257 and ensure the DASG Intellectual Property header remains intact.
+
+## License & Copyright
+This project is licensed under the **MIT License**.
+Copyright (c) 2026 DASG Consulting Ltda. (CNPJ: 61.628.969/0001-04). All rights reserved.

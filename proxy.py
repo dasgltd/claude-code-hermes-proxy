@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
+# ==============================================================================
+# @file proxy.py
+# @version 1.0.0
+# 
+# PROPRIEDADE INTELECTUAL DA DASG CONSULTING LTDA.
+# CNPJ 61.628.969/0001-04
+# Autor: Daniel A. Silva de la Garza
+# 
+# @description
+# claude-proxy: Translates Anthropic Messages API calls to `claude` CLI subprocess calls.
+# ==============================================================================
 """
-claude-proxy: Translates Anthropic Messages API calls to `claude` CLI subprocess calls.
-
-Third-party apps using a Claude Code OAuth token get HTTP 400
+claude-proxy: Translates Anthropic Messages API calls to `claude` CLI subprocess calls.Third-party apps using a Claude Code OAuth token get HTTP 400
 "Third-party apps draw from extra usage" when calling api.anthropic.com directly.
 This proxy routes those calls through the official `claude` CLI, which is a
 first-party Anthropic app and consumes from the Claude plan limits instead.
@@ -43,7 +52,20 @@ app = FastAPI(title="claude-proxy")
 
 
 def extract_text(content) -> str:
-    """Flatten a content value (string or list of Anthropic content blocks) to plain text."""
+    """
+    Flatten a content value (string or list of Anthropic content blocks) to plain text.
+    
+    BUSINESS RULE: Anthropic API allows `content` to be either a flat string or a complex
+    array of objects (text blocks, tool results). We must normalize this into a single 
+    string so we can pass it as a CLI argument to the `claude` binary without breaking
+    the shell execution.
+    
+    Args:
+        content (str | list): The content payload from an Anthropic message block.
+        
+    Returns:
+        str: A single flattened string containing all text and tool results.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -64,12 +86,21 @@ def build_prompt_and_system(
     messages: list, system: str | None
 ) -> tuple[str, str | None]:
     """
-    Convert the Anthropic messages array into (prompt, system_prompt).
-
-    Single user message  → passed directly as the CLI prompt.
-    Multi-turn history   → prior turns formatted as <conversation_history> and
-                           prepended to the system prompt; last user message
-                           becomes the CLI prompt.
+    Convert the Anthropic messages array into a single prompt and system prompt.
+    
+    BUSINESS RULE: The `claude` CLI does not natively accept a JSON array of prior 
+    messages in stateless mode (`-p`). To simulate memory, we must intercept all 
+    historical messages, format them into a custom XML-like `<conversation_history>` 
+    block, and prepend them to the system prompt. The very last user message is 
+    then extracted to serve as the actual CLI prompt.
+    
+    Args:
+        messages (list): Array of message objects containing 'role' and 'content'.
+        system (str | None): The original system prompt, if any.
+        
+    Returns:
+        tuple[str, str | None]: A tuple containing the extracted prompt (str) and 
+        the enriched system prompt (str or None).
     """
     if not messages:
         raise HTTPException(status_code=400, detail="messages array is empty")
@@ -108,6 +139,24 @@ def build_cmd(
     system_file: str | None = None,
     stream: bool = False,
 ) -> list[str]:
+    """
+    Constructs the CLI command list to execute the claude binary.
+    
+    BUSINESS RULE: We pass `--dangerously-skip-permissions` to ensure the CLI
+    does not hang waiting for human approval when executing. We also use 
+    `--no-session-persistence` to prevent polluting the local Claude Code history
+    with API requests.
+    
+    Args:
+        prompt (str): The final user message to be evaluated.
+        system (str | None): The system prompt (inline). Used if system_file is None.
+        model (str | None): The Claude model to use.
+        system_file (str | None): Path to a temp file containing the system prompt if too large.
+        stream (bool): Whether to request SSE streaming output from the CLI.
+        
+    Returns:
+        list[str]: The command array ready for subprocess execution.
+    """
     cmd = [
         CLAUDE_BIN,
         "-p", prompt,
@@ -128,7 +177,21 @@ def build_cmd(
 
 
 def _maybe_write_tempfile(text: str | None) -> tuple[str | None, str | None]:
-    """Write text to a temp file if it's long. Returns (system_arg, tempfile_path)."""
+    """
+    Write text to a temporary file if it exceeds typical shell argument limits.
+    
+    BUSINESS RULE: Shell commands can crash with `Argument list too long` if the 
+    system prompt (enriched with massive conversation history) is passed inline. 
+    If the text exceeds 4096 characters, we dump it to a temporary file and tell 
+    the CLI to read from it.
+    
+    Args:
+        text (str | None): The text to potentially write.
+        
+    Returns:
+        tuple[str | None, str | None]: A tuple containing (inline_text, tempfile_path).
+        If written to file, inline_text will be None.
+    """
     if not text or len(text) <= 4096:
         return text, None
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
@@ -141,7 +204,22 @@ def _maybe_write_tempfile(text: str | None) -> tuple[str | None, str | None]:
 
 
 async def _stream_sse(prompt: str, system: str | None, model: str | None):
-    """Run claude CLI and yield Anthropic-compatible SSE events."""
+    """
+    Run claude CLI asynchronously and yield Anthropic-compatible SSE events.
+    
+    BUSINESS RULE: Third-party apps like Open WebUI expect the standard Anthropic 
+    Server-Sent Events (SSE) stream format (`event: message_start`, `content_block_delta`, etc).
+    We must spawn the CLI in `stream-json` format, parse each JSON line yielded by 
+    Claude Code, and repackage it dynamically into the official SSE API schema.
+    
+    Args:
+        prompt (str): The user prompt.
+        system (str | None): The system prompt and history.
+        model (str | None): The requested model name.
+        
+    Yields:
+        str: Formatted SSE payload strings.
+    """
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     actual_model = model or "claude-sonnet-4-6"
 
@@ -219,6 +297,20 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
 
 @app.post("/v1/messages")
 async def messages_endpoint(request: Request):
+    """
+    FastAPI endpoint intercepting standard Anthropic API calls.
+    
+    BUSINESS RULE: This is the main entrypoint that tricks third-party apps into 
+    thinking they are talking directly to Anthropic. We parse the standard JSON 
+    body, extract parameters, and decide whether to route to the SSE generator 
+    or wait synchronously for the full response.
+    
+    Args:
+        request (Request): The incoming FastAPI HTTP request.
+        
+    Returns:
+        StreamingResponse | JSONResponse: The proxied response in Anthropic format.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -279,6 +371,12 @@ async def messages_endpoint(request: Request):
 
 @app.get("/health")
 async def health():
+    """
+    Health check endpoint to verify service uptime and CLI detection.
+    
+    Returns:
+        dict: Status message and the resolved path to the claude binary.
+    """
     return {"status": "ok", "claude_bin": CLAUDE_BIN}
 
 

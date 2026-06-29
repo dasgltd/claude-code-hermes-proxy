@@ -1,0 +1,23 @@
+# claude-proxy
+
+## System Context
+This repository provides a local API proxy that translates Anthropic Messages API calls (`POST /v1/messages`) into `claude` CLI subprocess calls. It enables third-party applications (e.g., Hermes, Open WebUI) to consume from first-party "Pro/Max" plan limits rather than requiring separate API usage credits.
+
+## Architecture
+- **`proxy.py`**: The core application built with FastAPI. It exposes the `/v1/messages` endpoint, parses incoming JSON payloads conforming to the Anthropic API schema, extracts the conversation history and parameters, and spawns a `claude -p "..."` subprocess. It intercepts the output in `stream-json` format and proxies it back to the client as Server-Sent Events (SSE).
+- **`install.sh`**: A bash installation script that sets up a Python virtual environment, installs dependencies, and configures a systemd user service (`claude-proxy.service`) to run the proxy continuously in the background on Linux.
+- **`claude-proxy.service`**: The systemd service unit template used by `install.sh`.
+- **`requirements.txt`**: Minimal Python dependencies (`fastapi`, `uvicorn`, `sse-starlette`).
+
+## Workflow
+1. Client sends standard Anthropic payload to `http://127.0.0.1:11435/v1/messages`.
+2. Proxy aggregates prior messages into a `<conversation_history>` block.
+3. Proxy executes `claude` CLI binary with the final message and the history prepended.
+4. CLI utilizes `~/.claude/.credentials.json` (OAuth token) to call `api.anthropic.com` natively as a first-party client.
+5. Proxy streams the JSON response back to the client.
+
+## LLM Instructions
+When modifying or reviewing this codebase:
+- Ensure any changes to the API schema in `proxy.py` remain strictly compatible with the official Anthropic Messages API documentation.
+- Maintain the asynchronous streaming capabilities (SSE) as third-party clients rely on it for real-time response generation.
+- Keep the `install.sh` idempotent and mindful of the user's local environment paths (`~/.local/lib/claude-proxy`).
