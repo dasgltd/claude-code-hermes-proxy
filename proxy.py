@@ -154,6 +154,7 @@ def build_cmd(
     model: str | None,
     system_file: str | None = None,
     stream: bool = False,
+    effort: str | None = None,
 ) -> list[str]:
     """
     Constructs the CLI command list to execute the claude binary.
@@ -188,6 +189,8 @@ def build_cmd(
         cmd.extend(["--system-prompt", system])
     if model and model.startswith("claude-"):
         cmd.extend(["--model", model])
+    if effort and effort in _VALID_EFFORTS:
+        cmd.extend(["--effort", effort])
     return cmd
 
 
@@ -253,6 +256,36 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4) if text else 0
 
 
+_BUDGET_TO_EFFORT = {32000: "max", 16000: "high", 8000: "medium", 4000: "low"}
+_VALID_EFFORTS = {"low", "minimal", "medium", "high", "xhigh", "max"}
+
+
+def _extract_effort(body: dict) -> str | None:
+    """Extract reasoning effort from an Anthropic API request body.
+
+    Hermes sends effort in two formats depending on model age:
+      - Adaptive (Claude 4.6+): output_config.effort = "medium" | "high" | "xhigh" | "max"
+      - Legacy  (Claude 4.5-):  thinking.type="enabled", budget_tokens=8000
+    Maps both to a single effort string for --effort <level>.
+    """
+    output_cfg = body.get("output_config")
+    if isinstance(output_cfg, dict):
+        effort = output_cfg.get("effort", "")
+        if isinstance(effort, str) and effort.lower() in _VALID_EFFORTS:
+            return effort.lower()
+
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens", 0)
+        if isinstance(budget, int) and budget > 0:
+            for tokens, effort in sorted(_BUDGET_TO_EFFORT.items(), reverse=True):
+                if budget >= tokens:
+                    return effort
+            return "low"
+
+    return None
+
+
 # ── Streaming response ────────────────────────────────────────────────────────
 
 
@@ -263,7 +296,7 @@ async def _drain(stream) -> bytes:
     return await stream.read()
 
 
-async def _stream_sse(prompt: str, system: str | None, model: str | None):
+async def _stream_sse(prompt: str, system: str | None, model: str | None, effort: str | None = None):
     """
     Run claude CLI asynchronously and yield Anthropic-compatible SSE events.
 
@@ -285,7 +318,7 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None):
     inline_system, system_file = _maybe_write_tempfile(system)
     stderr_task = None
     try:
-        cmd = build_cmd(inline_system, model, system_file=system_file, stream=True)
+        cmd = build_cmd(inline_system, model, system_file=system_file, stream=True, effort=effort)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -426,6 +459,7 @@ async def messages_endpoint(request: Request):
     system = body.get("system")
     model = body.get("model")
     do_stream = body.get("stream", False)
+    effort = _extract_effort(body)
 
     if isinstance(system, list):
         system = extract_text(system)
@@ -434,7 +468,7 @@ async def messages_endpoint(request: Request):
 
     if do_stream:
         return StreamingResponse(
-            _stream_sse(prompt, combined_system, model),
+            _stream_sse(prompt, combined_system, model, effort=effort),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -442,7 +476,7 @@ async def messages_endpoint(request: Request):
     # Non-streaming
     inline_system, system_file = _maybe_write_tempfile(combined_system)
     try:
-        cmd = build_cmd(inline_system, model, system_file=system_file, stream=False)
+        cmd = build_cmd(inline_system, model, system_file=system_file, stream=False, effort=effort)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
