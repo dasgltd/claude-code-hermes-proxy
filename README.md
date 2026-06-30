@@ -71,7 +71,17 @@ In `~/.hermes/config.yaml`:
 ```yaml
 model:
   provider: anthropic
-  default: claude-sonnet-4-6   # or claude-opus-4-8, claude-haiku-4-5
+  default: claude-opus-4-8   # or claude-sonnet-4-6, claude-haiku-4-5
+
+# Optional: fallback chain if primary model fails
+fallback_model:
+  - provider: anthropic
+    model: claude-sonnet-4-6
+
+# Optional: reasoning effort (low | medium | high | xhigh | max)
+# The proxy forwards this to the claude CLI via --effort
+agent:
+  reasoning_effort: high
 ```
 
 In `~/.hermes/.env`:
@@ -85,6 +95,20 @@ Then restart the gateway:
 ```bash
 systemctl --user restart hermes-gateway
 ```
+
+### Image / vision support
+
+The proxy passes only text to the `claude` CLI — image content blocks are dropped. If you send images via Hermes (e.g. Telegram photo), configure a dedicated vision provider so Hermes analyses the image externally and passes the description to Claude as text:
+
+```yaml
+# ~/.hermes/config.yaml
+auxiliary:
+  vision:
+    provider: gemini          # uses GOOGLE_API_KEY from ~/.hermes/.env
+    model: gemini-2.5-flash
+```
+
+With this config, Hermes automatically routes images through Gemini for analysis and feeds the result to Claude — no changes to the proxy needed.
 
 ## Verify
 
