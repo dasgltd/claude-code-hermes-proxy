@@ -428,6 +428,13 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None, effort
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Raise the StreamReader line buffer well above the asyncio 64 KiB
+            # default. In stream-json mode the CLI emits one JSON object per line;
+            # when the Read tool pulls an image into the turn, that single line can
+            # embed a large base64/tool_result payload and blow past 64 KiB, making
+            # readline() raise "Separator is not found, and chunk exceed the limit"
+            # and killing the SSE stream right after the ping. 32 MiB is ample.
+            limit=32 * 1024 * 1024,
         )
         # Feed the prompt via stdin, then close it so the CLI can proceed.
         proc.stdin.write(prompt.encode("utf-8"))
