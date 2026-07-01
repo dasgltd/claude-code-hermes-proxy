@@ -42,6 +42,8 @@ Design notes:
 """
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -101,9 +103,100 @@ def extract_text(content) -> str:
     return str(content) if content else ""
 
 
+_MEDIA_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _write_image_tempfile(source) -> str | None:
+    """
+    Persist an Anthropic image block's bytes to a temp file on disk.
+
+    The `claude` CLI (headless `-p` mode) has no way to receive inline image bytes
+    over stdin, but it CAN read an image file from disk via its Read tool. So we
+    decode the base64 payload, drop it into a temp file, and return the path — the
+    caller then injects that path into the prompt for the CLI to Read.
+
+    Args:
+        source (dict): The Anthropic image block `source` object.
+
+    Returns:
+        str | None: Absolute path to the written image, or None if unusable.
+    """
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") != "base64":
+        # url-type sources are not supported by the headless CLI path.
+        return None
+    data = source.get("data")
+    if not data:
+        return None
+    media_type = source.get("media_type", "image/png")
+    ext = _MEDIA_EXT.get(media_type, ".png")
+    try:
+        raw = base64.b64decode(data, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if not raw:
+        return None
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="wb", prefix="claude-proxy-img-", suffix=ext, delete=False
+        )
+        tmp.write(raw)
+        tmp.close()
+    except OSError:
+        return None
+    return tmp.name
+
+
+def extract_prompt_with_images(content) -> tuple[str, list[str]]:
+    """
+    Flatten a content value to text AND materialize any image blocks to disk.
+
+    Same flattening as extract_text, but image blocks are written to temp files and
+    replaced inline with a path reference instructing the CLI to Read them. Used only
+    for the current-turn user message so history images don't bloat the context.
+
+    Args:
+        content (str | list): The content payload from an Anthropic message block.
+
+    Returns:
+        tuple[str, list[str]]: (flattened prompt text, list of temp image paths to clean up).
+    """
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return (str(content) if content else ""), []
+    parts = []
+    image_paths = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            parts.append(block.get("text", ""))
+        elif btype == "tool_result":
+            parts.append(f"[tool result: {extract_text(block.get('content', ''))}]")
+        elif btype == "image":
+            path = _write_image_tempfile(block.get("source"))
+            if path:
+                image_paths.append(path)
+                parts.append(
+                    f"[An image is attached at the local path: {path}\n"
+                    f"Use the Read tool on that exact path to view the image, "
+                    f"then answer the request about it.]"
+                )
+    return "\n".join(p for p in parts if p), image_paths
+
+
 def build_prompt_and_system(
     messages: list, system: str | None
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, list[str]]:
     """
     Convert the Anthropic messages array into a single prompt and system prompt.
 
@@ -129,11 +222,13 @@ def build_prompt_and_system(
     if last_user_idx is None:
         raise HTTPException(status_code=400, detail="no user message found")
 
-    prompt = extract_text(messages[last_user_idx].get("content", ""))
+    prompt, image_paths = extract_prompt_with_images(
+        messages[last_user_idx].get("content", "")
+    )
     history = messages[:last_user_idx]
 
     if not history:
-        return prompt, system
+        return prompt, system, image_paths
 
     lines = []
     for msg in history:
@@ -146,7 +241,7 @@ def build_prompt_and_system(
         "<conversation_history>\n" + "\n\n".join(lines) + "\n</conversation_history>"
     )
     combined = f"{history_block}\n\n{system}" if system else history_block
-    return prompt, combined
+    return prompt, combined, image_paths
 
 
 def build_cmd(
@@ -296,7 +391,16 @@ async def _drain(stream) -> bytes:
     return await stream.read()
 
 
-async def _stream_sse(prompt: str, system: str | None, model: str | None, effort: str | None = None):
+def _cleanup_paths(paths) -> None:
+    """Best-effort removal of temp files (image attachments)."""
+    for p in paths or []:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+async def _stream_sse(prompt: str, system: str | None, model: str | None, effort: str | None = None, image_paths: list | None = None):
     """
     Run claude CLI asynchronously and yield Anthropic-compatible SSE events.
 
@@ -430,6 +534,7 @@ async def _stream_sse(prompt: str, system: str | None, model: str | None, effort
                 os.unlink(system_file)
             except OSError:
                 pass
+        _cleanup_paths(image_paths)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -464,11 +569,11 @@ async def messages_endpoint(request: Request):
     if isinstance(system, list):
         system = extract_text(system)
 
-    prompt, combined_system = build_prompt_and_system(messages_list, system)
+    prompt, combined_system, image_paths = build_prompt_and_system(messages_list, system)
 
     if do_stream:
         return StreamingResponse(
-            _stream_sse(prompt, combined_system, model, effort=effort),
+            _stream_sse(prompt, combined_system, model, effort=effort, image_paths=image_paths),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -490,6 +595,7 @@ async def messages_endpoint(request: Request):
                 os.unlink(system_file)
             except OSError:
                 pass
+        _cleanup_paths(image_paths)
 
     stderr_text = (stderr or b"").decode(errors="replace").strip()
 
